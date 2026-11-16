@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use super::config::{DeploySection, UpgradeMode};
 use super::manifest::{self, Entry};
 use super::protocol::{self, ArtifactFormat, Data, Event, Need, PROTOCOL, Plan};
-use super::{cron, envphp, fcgi, redis};
+use super::{cron, envphp, fcgi, redis, session};
 
 /// A child process's stdout, pointed at our stderr: stdout is the protocol.
 pub fn stderr_stdio() -> Stdio {
@@ -32,10 +32,11 @@ pub fn stderr_stdio() -> Stdio {
 }
 
 pub fn run() -> ExitCode {
+    session::detach();
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
-    let mut out = std::io::stdout().lock();
-    match serve(&mut input, &mut out) {
+    let mut out = session::ToRunner(std::io::stdout().lock());
+    let code = match serve(&mut input, &mut out) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("agent: {e:#}");
@@ -47,7 +48,9 @@ pub fn run() -> ExitCode {
             );
             ExitCode::FAILURE
         }
-    }
+    };
+    session::finish();
+    code
 }
 
 fn serve(input: &mut impl BufRead, out: &mut impl Write) -> Result<()> {
@@ -146,6 +149,11 @@ impl<'o, W: Write> Deploy<'o, W> {
     }
 
     fn step(&mut self, name: &str, since: Instant, detail: Option<String>) -> Result<()> {
+        session::log_line(&format!(
+            "step {name} {}ms {}",
+            since.elapsed().as_millis(),
+            detail.as_deref().unwrap_or("")
+        ));
         protocol::send(
             self.out,
             &Event::Step {
@@ -220,6 +228,7 @@ impl<'o, W: Write> Deploy<'o, W> {
             fs::create_dir_all(self.root.join(dir))?;
         }
         self._lock = Some(lock(&self.root)?);
+        session::open_log(&self.root);
         // Pruned releases whose cleanup did not finish (it was killed, or the
         // host has no detached processes) go while this one streams.
         let releases = self.root.join("releases");
@@ -368,6 +377,9 @@ impl<'o, W: Write> Deploy<'o, W> {
                 self.maintenance_on = true;
                 set_maintenance_flag(&release)?;
             }
+            // Past here stopping halfway is worse than finishing, so a lost
+            // runner no longer stops the deploy.
+            session::commit();
             self.upgrade_started = true;
             if config_import {
                 magento(
@@ -395,6 +407,7 @@ impl<'o, W: Write> Deploy<'o, W> {
         let t = Instant::now();
         // Maintenance someone switched on stays on: the new release comes up
         // in it too, even when this deploy had nothing to upgrade.
+        session::commit();
         if self.kept_maintenance || self.maintenance_on {
             set_maintenance_flag(&release)?;
         }
@@ -464,6 +477,15 @@ impl<'o, W: Write> Deploy<'o, W> {
         // Deleting a release takes seconds, so it happens after the agent
         // exits, in a process of its own.
         spawn_detached_cleanup(&self.root.join("releases"));
+        session::log_line(&format!(
+            "done: release {name} in {}ms{}",
+            self.started.elapsed().as_millis(),
+            if session::runner_gone() {
+                " (the runner had gone)"
+            } else {
+                ""
+            }
+        ));
         protocol::send(
             self.out,
             &Event::Done {

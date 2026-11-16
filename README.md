@@ -280,7 +280,12 @@ at a time, so a deploy costs one round trip instead of about a hundred:
    the deploy leaves it on. If an import or upgrade fails partway, the database
    may match neither release, so the agent fails closed: maintenance stays on,
    cron stays stopped, and `.dep/upgrade-failed` tells the next deploy to
-   clear that flag once it gets through. The agent sets and clears `var/.maintenance.flag` itself, exactly as
+   clear that flag once it gets through. Once an upgrade has started, or the
+   swap is next, the agent finishes even if the ssh connection drops (CI
+   cancelled or timed out): it ignores SIGHUP, keeps PHP's output off the
+   dead connection, and writes how the deploy ended to `.dep/last-deploy.log`.
+   Before that point a dropped connection still stops the deploy with the
+   store untouched. The agent sets and clears `var/.maintenance.flag` itself, exactly as
    `maintenance:enable`/`disable` do, without booting PHP. Like Deployer's
    recipe, share `var/.maintenance.ip` but not the flag: a missing shared file
    is created empty, which is maintenance on, and Magento's disable deletes the
